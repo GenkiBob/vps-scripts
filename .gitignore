@@ -1,0 +1,15 @@
+# 本地凭据与环境配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# 运行产物
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
