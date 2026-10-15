@@ -3,6 +3,7 @@
 # 编号保持稳定；0 保留给退出。新增功能只需增加一行并创建对应脚本。
 MENU_ITEMS=(
     '1|运行演示脚本|scripts/example.sh'
+    '2|配置 SmartDNS|scripts/configure-smartdns.sh'
 )
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
