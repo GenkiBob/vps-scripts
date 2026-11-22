@@ -3,6 +3,8 @@
 MENU_ITEMS=(
     '1|运行演示脚本|scripts/example.sh'
     '2|配置 SmartDNS|scripts/configure-smartdns.sh'
+    '3|安装 Shadowsocks 服务端|scripts/install-shadowsocks.sh'
+    '4|安装 SOCKS5 服务端|scripts/install-socks5.sh'
 )
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 readonly PROJECT_ROOT
