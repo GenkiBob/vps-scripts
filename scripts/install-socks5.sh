@@ -105,12 +105,13 @@ proxy_create_config() {
     [[ "$hash" == \$6\$* && "$hash" != *$'\n'* ]] || proxy_fail '无法生成密码哈希。'
     printf '%s:%s\n' "$account" "$hash" > "$stage/users"
     printf '%s\n' "$secret" > "$stage/password"
+    # Dante 先读取地址族，再展开出口网卡地址。
     cat > "$stage/danted.conf" <<EOF
 $CONFIG_HEADER
 logoutput: stderr
 internal: 0.0.0.0 port = $port
-external: $interface
 external.protocol: ipv4
+external: $interface
 user.privileged: root
 user.notprivileged: nobody
 clientmethod: none
