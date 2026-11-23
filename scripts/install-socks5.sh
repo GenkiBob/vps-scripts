@@ -374,10 +374,10 @@ probe_socks5() {
 }
 
 probe_hev_socks5() {
-    local relay_addresses
+    local relay_addresses status=0
     relay_addresses="$(proxy_resolve_relay_ipv4 "$4")" || return 1
     # The probes send data through real SOCKS5 sessions to local echo sockets.
-    printf '%s\n%s\n' "$2" "$3" | timeout 6 python3 -c '
+    printf '%s\n%s\n' "$2" "$3" | timeout 15 python3 -c '
 import ipaddress
 import socket
 import struct
@@ -388,7 +388,7 @@ relay_addresses = {ipaddress.ip_address(value) for value in sys.argv[2].split()}
 account = sys.stdin.buffer.readline().rstrip(b"\n")
 password = sys.stdin.buffer.readline().rstrip(b"\n")
 local = "127.0.0.1"
-socket.setdefaulttimeout(2)
+socket.setdefaulttimeout(4)
 
 def receive(sock, size):
     data = b""
@@ -420,13 +420,16 @@ def request(sock, command, target):
         ip = ip.ipv4_mapped
     return ip, struct.unpack("!H", receive(sock, 2))[0]
 
+phase = "TCP 连接与认证"
 try:
     with socket.socket() as server, socket.create_connection((local, port)) as control:
         server.bind((local, 0))
         server.listen(1)
         authenticate(control)
+        phase = "TCP CONNECT"
         request(control, 1, server.getsockname())
         connection, _ = server.accept()
+        phase = "TCP 本机转发"
         with connection:
             control.sendall(b"tcp")
             if receive(connection, 3) != b"tcp":
@@ -435,17 +438,20 @@ try:
             if receive(control, 2) != b"ok":
                 raise OSError("invalid TCP relay response")
 
+    phase = "UDP 会话认证"
     with socket.socket(type=socket.SOCK_DGRAM) as server, \
          socket.socket(type=socket.SOCK_DGRAM) as client, \
          socket.create_connection((local, port)) as control:
         server.bind((local, 0))
         client.bind((local, 0))
         authenticate(control)
+        phase = "UDP ASSOCIATE 中继地址与端口"
         relay_address, relay_port = request(control, 3, client.getsockname())
         if relay_address not in relay_addresses or relay_port != port:
             raise OSError("unexpected UDP relay address or port")
         header = b"\x00\x00\x00" + address(*server.getsockname())
         # The public NAT address is checked above. The local probe bypasses NAT.
+        phase = "UDP 本机转发"
         client.sendto(header + b"udp", (local, port))
         payload, peer = server.recvfrom(65535)
         if payload != b"udp":
@@ -454,8 +460,38 @@ try:
         if client.recvfrom(65535) != (header + b"ok", (local, port)):
             raise OSError("invalid UDP relay response")
 except (OSError, ValueError, struct.error) as error:
-    sys.exit(str(error))
-' "$1" "$relay_addresses"
+    sys.exit(f"{phase}: {error}")
+' "$1" "$relay_addresses" || status=$?
+    if ((status == 124)); then printf 'TCP/UDP 转发探测超时。\n' >&2; fi
+    return "$status"
+}
+
+proxy_wait_start() {
+    local port="$1" kind="$2" unit secret deadline result=''
+    local socks_port socks_user socks_hash socks_mode socks_relay
+    if ! proxy_socks_is_hev "$kind"; then proxy_wait "$@"; return; fi
+    unit="$(proxy_unit "$port" "$kind")"
+    proxy_socks_record "$kind" || { printf '无法读取 SOCKS5 实例配置。\n' >&2; return 1; }
+    IFS= read -r secret < "$(proxy_socks_dir "$kind")/password" ||
+        { printf '无法读取 SOCKS5 实例密码。\n' >&2; return 1; }
+    deadline=$((SECONDS + 60))
+    until systemctl is-active --quiet "$unit" && probe_socks5 "$port" "$socks_user" "$secret"; do
+        if ((SECONDS >= deadline)); then
+            printf 'SOCKS5 本机 TCP 连接或认证未通过。\n' >&2
+            return 1
+        fi
+        sleep 1
+    done
+    if result="$(probe_hev_socks5 "$port" "$socks_user" "$secret" "${socks_relay:-127.0.0.1}" 2>&1)"; then
+        printf 'SOCKS5 本机 TCP 和 UDP 转发验证通过。\n'
+        return 0
+    fi
+    if systemctl is-active --quiet "$unit" && probe_socks5 "$port" "$socks_user" "$secret"; then
+        printf 'SOCKS5 TCP 认证通过，保留服务运行。转发探测未通过：%s\n' "${result:-探测超时或解析失败。}" >&2
+        return 0
+    fi
+    printf 'SOCKS5 转发探测后，TCP 连接或认证未通过：%s\n' "${result:-请查看临时日志。}" >&2
+    return 1
 }
 
 proxy_wait() {

@@ -338,6 +338,8 @@ proxy_prepare_unit() {
     systemctl daemon-reload
 }
 
+proxy_wait_start() { proxy_wait "$@"; }
+
 proxy_start() {
     local port="$1" kind="$2" unit state
     unit="$(proxy_unit "$port" "$kind")"
@@ -351,7 +353,7 @@ proxy_start() {
     proxy_stopped "$unit" || proxy_fail '实例正在切换状态，请稍后再试。'
     proxy_prepare_unit "$port" "$kind"
     systemctl reset-failed "$unit" 2>/dev/null || true
-    if ! systemctl start "$unit" || ! proxy_wait "$port" "$kind" || ! systemctl enable "$unit"; then
+    if ! systemctl start "$unit" || ! proxy_wait_start "$port" "$kind" || ! systemctl enable "$unit"; then
         systemctl disable --now "$unit" || printf '无法清理启动失败的实例，请检查 %s。\n' "$unit" >&2
         proxy_fail '启动验证失败，可选择临时日志进行诊断。'
     fi
