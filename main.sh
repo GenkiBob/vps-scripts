@@ -8,42 +8,14 @@ MENU_ITEMS=(
 )
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 readonly PROJECT_ROOT
-readonly DOWNLOAD_BASE='https://raw.githubusercontent.com/GenkiBob/vps-scripts'
-readonly CONTENTS_BASE='https://api.github.com/repos/GenkiBob/vps-scripts/contents'
 REMOTE_MODE=false
 REVISION=''
 if [[ -f "$PROJECT_ROOT/.revision" ]]; then
     IFS= read -r REVISION < "$PROJECT_ROOT/.revision"
     [[ "$REVISION" =~ ^[a-f0-9]{40}$ ]] || { printf '本地版本文件错误。\n' >&2; exit 1; }
+    # shellcheck source=start.sh
+    source "$PROJECT_ROOT/start.sh" || exit 1
 fi
-
-download_script() {
-    local path="$1" destination="$2" response
-    if wget --https-only --timeout=30 --tries=2 --no-verbose -O "$destination" \
-        "$DOWNLOAD_BASE/$REVISION/$path"; then
-        return 0
-    else
-        printf 'GitHub Raw 下载失败（wget 退出码 %s），尝试 GitHub Contents API：%s\n' "$?" "$path" >&2
-    fi
-
-    if ! response="$(wget --https-only --timeout=15 --tries=1 --no-verbose --server-response \
-        --header='Accept: application/vnd.github.raw+json' -O "$destination" \
-        "$CONTENTS_BASE/$path?ref=$REVISION" 2>&1)"; then
-        # Keep HTTP status and wget errors, without printing response headers such as cookies.
-        awk '$1 ~ /^HTTP\// || /^[^[:space:]]/' <<< "$response" >&2
-        printf '备用下载失败：%s（提交 %s）。\n' "$path" "${REVISION:0:12}" >&2
-        return 1
-    fi
-    # Reject API metadata if a proxy strips the media type negotiation header.
-    if ! awk '
-        $1 ~ /^HTTP\// { media = "" }
-        tolower($1) == "content-type:" { media = tolower($2); sub(/[;\r].*/, "", media) }
-        END { exit (media != "application/vnd.github.raw+json") }
-    ' <<< "$response"; then
-        printf 'GitHub Contents API 未返回脚本正文：%s。\n' "$path" >&2
-        return 1
-    fi
-}
 
 # 文件组来自固定提交；全部验证完成后才标记为可用。
 ensure_cached() (
@@ -70,7 +42,7 @@ ensure_cached() (
     for path in "${files[@]}"; do
         mkdir -p -- "$stage/$(dirname -- "$path")" || return 1
         printf '首次下载或准备更新：%s\n' "$path"
-        download_script "$path" "$stage/$path" || return 1
+        download_script "$REVISION" "$path" "$stage/$path" || return 1
         [[ -s "$stage/$path" ]] && bash -n "$stage/$path" || { printf '下载为空或语法错误：%s\n' "$path" >&2; return 1; }
     done
     for path in "${files[@]}"; do
