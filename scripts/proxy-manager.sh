@@ -257,6 +257,8 @@ proxy_install_packages() {
     fi
 }
 
+proxy_install_dependencies() { proxy_install_packages; }
+
 proxy_package_unused() {
     local name units path state current
     local owner="$PROXY_ROOT/.package"
@@ -412,7 +414,7 @@ proxy_retire_dir() {
 proxy_uninstall() {
     local port
     if ((${#proxy_ports[@]} > 0)); then proxy_list; fi
-    printf '将清理 %s 的全部受管实例、凭据和专用文件，并检查是否可以卸载 %s。\n' "$PROXY_LABEL" "$PROXY_PACKAGE"
+    printf '将清理 %s 的全部受管实例、凭据、专用文件和可安全移除的依赖。\n' "$PROXY_LABEL"
     proxy_confirm '确认卸载' || return 0
     for port in "${proxy_ports[@]}"; do
         proxy_assert_no_debug "$port"
@@ -422,6 +424,7 @@ proxy_uninstall() {
     for port in "${proxy_ports[@]}"; do proxy_stop "$port" "${proxy_instances[$port]}"; done
     for port in "${proxy_ports[@]}"; do proxy_remove_instance "$port" "${proxy_instances[$port]}"; done
     proxy_remove_interrupted_stages
+    if declare -F proxy_remove_dependencies >/dev/null; then proxy_remove_dependencies; fi
     proxy_purge_package
     if [[ ! -L "$PROXY_PRESET" && -f "$PROXY_PRESET" && "$(<"$PROXY_PRESET")" == "$(proxy_preset_content)" ]]; then
         rm -f -- "$PROXY_PRESET"
@@ -513,16 +516,15 @@ proxy_install() {
     proxy_read_credentials
     trap proxy_install_cleanup EXIT
     if [[ ! -d "$PROXY_ROOT" ]]; then mkdir -m 0700 -- "$PROXY_ROOT"; fi
-    proxy_install_packages
+    proxy_install_dependencies
     proxy_assert_free_port "$install_port"
     install_stage="$(mktemp -d -- "$PROXY_ROOT/.stage.XXXXXX")"
     proxy_create_config "$install_port" "$install_stage" "$username" "$password"
-    install_prepared=true
-    proxy_install_protocol_file "$install_port" "$install_target"
     mv -nT -- "$install_stage" "$install_target"
     [[ ! -e "$install_stage" ]] || proxy_fail "端口 $install_port 的配置目录已存在。"
     install_stage=''
     install_published=true
+    install_prepared=true
     proxy_prepare_unit "$install_port" "$install_target"
     systemctl start "$install_unit" || proxy_fail '安装启动失败。'
     proxy_wait "$install_port" "$install_target" "$username" "$password" ||
@@ -560,6 +562,10 @@ proxy_action() {
             proxy_remove_instance "$port" "$kind"
             printf '已删除端口 %s 的实例。\n' "$port"
             ;;
+        8)
+            if declare -F proxy_convert >/dev/null; then proxy_convert "$port" "$kind"
+            else printf '输入错误。\n'; fi
+            ;;
     esac
 }
 
@@ -574,11 +580,17 @@ proxy_menu() {
     while true; do
         printf '\n========== %s 管理 ==========\n' "$PROXY_LABEL"
         proxy_scan && proxy_list || proxy_fail '无法读取实例列表。'
-        printf '1. 安装\n2. 停止\n3. 卸载\n4. 查看\n5. 启动\n6. 临时日志\n7. 删除实例\n0. 返回\n请选择：'
+        printf '1. 安装\n2. 停止\n3. 卸载\n4. 查看\n5. 启动\n6. 临时日志\n7. 删除实例\n'
+        if declare -F proxy_convert >/dev/null; then printf '8. 转换现有实例为 TCP/UDP 同端口\n'; fi
+        printf '0. 返回\n请选择：'
         IFS= read -r action || return 0
         case "$action" in
             0) return 0 ;;
-            [1-7])
+            [1-8])
+                if [[ "$action" == 8 ]] && ! declare -F proxy_convert >/dev/null; then
+                    printf '输入错误。\n'
+                    continue
+                fi
                 set +e
                 (set -e; proxy_action "$action")
                 status=$?
