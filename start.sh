@@ -16,16 +16,40 @@ current_root() {
     printf '%s\n' "$INSTALL_ROOT/versions/$version"
 }
 
+resolve_revision() {
+    local reply_file="$1" revision first_line
+    if wget --https-only --timeout=15 --tries=1 --no-verbose --header='Accept: application/vnd.github.sha' \
+        -O "$reply_file" 'https://api.github.com/repos/GenkiBob/vps-scripts/commits/main'; then
+        revision="$(tr -d '\r\n' < "$reply_file")"
+        if [[ "$revision" =~ ^[a-f0-9]{40}$ ]]; then
+            printf '%s\n' "$revision"
+            return 0
+        fi
+        printf 'GitHub API 未返回有效的提交 SHA。\n' >&2
+    else
+        printf 'GitHub API 版本查询失败（wget 退出码 %s）。\n' "$?" >&2
+    fi
+
+    printf '正在通过 GitHub 提交补丁查询版本……\n' >&2
+    if ! wget --https-only --timeout=15 --tries=1 --no-verbose -O "$reply_file" \
+        'https://github.com/GenkiBob/vps-scripts/commit/main.patch'; then
+        printf 'GitHub 备用版本查询失败。\n' >&2
+        return 1
+    fi
+    if ! IFS= read -r first_line < "$reply_file" || ! [[ "$first_line" =~ ^From\ ([a-f0-9]{40})\  ]]; then
+        printf 'GitHub 提交补丁未返回有效的提交 SHA。\n' >&2
+        return 1
+    fi
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 install_version() (
     local previous="$1" revision_file stage='' launcher_temp='' pointer_temp='' revision path
     command -v wget >/dev/null 2>&1 || { printf '安装或更新需要 wget。\n' >&2; return 1; }
     revision_file="$(mktemp "$INSTALL_ROOT/.revision.XXXXXX")" || return 1
     trap 'rm -f -- "$revision_file"; [[ -z "$launcher_temp" ]] || rm -f -- "$launcher_temp"; [[ -z "$pointer_temp" ]] || rm -f -- "$pointer_temp"; [[ -z "$stage" ]] || rm -rf -- "$stage"' EXIT
     printf '正在检查版本……\n'
-    wget --https-only --timeout=30 --tries=2 -q --header='Accept: application/vnd.github.sha' -O "$revision_file" \
-        'https://api.github.com/repos/GenkiBob/vps-scripts/commits/main' || return 1
-    revision="$(tr -d '\r\n' < "$revision_file")"
-    [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { printf '远端版本格式错误。\n' >&2; return 1; }
+    revision="$(resolve_revision "$revision_file")" || return 1
     if [[ -n "$previous" && "$(cat "$previous/.revision")" == "$revision" ]]; then
         printf '当前已是最新版本：%s\n' "${revision:0:12}"
         return 0
@@ -34,9 +58,15 @@ install_version() (
     printf '%s\n' "$revision" > "$stage/.revision" || return 1
     for path in start.sh main.sh; do
         printf '正在下载：%s\n' "$path"
-        wget --https-only --timeout=30 --tries=2 -q -O "$stage/$path" \
-            "https://raw.githubusercontent.com/GenkiBob/vps-scripts/$revision/$path" || return 1
-        [[ -s "$stage/$path" ]] && bash -n "$stage/$path" || return 1
+        wget --https-only --timeout=30 --tries=2 --no-verbose -O "$stage/$path" \
+            "https://raw.githubusercontent.com/GenkiBob/vps-scripts/$revision/$path" || {
+            printf '下载失败：%s（提交 %s）。\n' "$path" "${revision:0:12}" >&2
+            return 1
+        }
+        [[ -s "$stage/$path" ]] && bash -n "$stage/$path" || {
+            printf '下载内容为空或 Bash 语法验证失败：%s。\n' "$path" >&2
+            return 1
+        }
     done
     # 由新版菜单读取新版登记表，只预下载已使用功能的新版本，不运行功能。
     bash "$stage/main.sh" --prepare-update "$previous" || return 1
