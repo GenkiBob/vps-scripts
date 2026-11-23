@@ -118,6 +118,41 @@ proxy_valid_ipv4() {
     for octet in "$a" "$b" "$c" "$d"; do ((octet <= 255)) || return 1; done
 }
 
+proxy_valid_relay_name() {
+    local name="${1%.}" label last_label
+    local -a labels
+    if proxy_valid_ipv4 "$1"; then return 0; fi
+    [[ "${#name}" -le 253 && "$name" == *.* && "$name" != .* &&
+        "$name" != *. && "$name" != *..* ]] || return 1
+    IFS=. read -r -a labels <<< "$name"
+    for label in "${labels[@]}"; do
+        [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+        last_label="$label"
+    done
+    # Numeric endpoints must use the IPv4 syntax checked above.
+    [[ "$last_label" == *[a-zA-Z]* ]]
+}
+
+proxy_resolve_relay_ipv4() {
+    if proxy_valid_ipv4 "$1"; then printf '%s\n' "$1"; return; fi
+    timeout 8 python3 -c '
+import socket
+import sys
+
+try:
+    addresses = socket.getaddrinfo(sys.argv[1], None, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+except OSError:
+    sys.exit("DDNS 无法解析，请检查 DNS 和 A 记录。")
+if any(item[0] == socket.AF_INET6 for item in addresses):
+    sys.exit("IPv4 NAT 模式需要仅有 A 记录的 DDNS 域名。")
+ipv4 = sorted({item[4][0] for item in addresses if item[0] == socket.AF_INET})
+if not ipv4:
+    sys.exit("DDNS 域名缺少 IPv4 A 记录。")
+print(" ".join(ipv4))
+' "$1"
+}
+
 proxy_socks_record() {
     local dir config udp_port
     if ! proxy_socks_is_hev "$1"; then
@@ -140,7 +175,7 @@ proxy_socks_record() {
         "$socks_user" =~ ^[a-zA-Z0-9_.-]{1,64}$ ]] || return 1
     case "$socks_mode" in
         direct) [[ -z "$socks_relay" ]] ;;
-        nat) proxy_valid_ipv4 "$socks_relay" ;;
+        nat) proxy_valid_relay_name "$socks_relay" ;;
         *) return 1 ;;
     esac
 }
@@ -218,15 +253,18 @@ EOF
 }
 
 proxy_read_mode() {
-    local choice
+    local choice default=1 saved_relay="${2:-}" label
+    if [[ "${1:-}" == nat ]]; then default=2; fi
+    label='NAT 公网 IPv4 或 DDNS 域名（域名使用 A 记录，TCP 和 UDP 同端口映射）'
+    if [[ -n "$saved_relay" ]]; then label+=" [$saved_relay]"; fi
     while true; do
-        choice="$(proxy_prompt '1 公网直连 VPS / 2 NAT VPS [1]' 1)"
+        choice="$(proxy_prompt "1 公网直连 VPS / 2 NAT VPS [$default]" "$default")"
         case "$choice" in
             1) socks_mode=direct socks_relay=''; return ;;
             2)
-                socks_relay="$(proxy_prompt 'NAT 公网 IPv4（TCP 和 UDP 需映射到 VPS 的同一个端口号）' '')"
-                if proxy_valid_ipv4 "$socks_relay"; then socks_mode=nat; return; fi
-                printf '请输入有效的公网 IPv4 地址。\n'
+                socks_relay="$(proxy_prompt "$label" "$saved_relay")"
+                if proxy_valid_relay_name "$socks_relay"; then socks_mode=nat; return; fi
+                printf '请输入公网 IPv4 或完整 DDNS 域名。\n'
                 ;;
             *) printf '请选择 1 或 2。\n' ;;
         esac
@@ -253,6 +291,12 @@ proxy_valid_password() {
     [[ -n "$1" && ${#1} -le 255 && "$1" != *$'\r'* && "$1" != *$'\n'* ]]
 }
 
+proxy_check_relay() {
+    if [[ "$socks_mode" == nat ]]; then
+        proxy_resolve_relay_ipv4 "$socks_relay" >/dev/null || proxy_fail '无法验证 NAT 中继地址。'
+    fi
+}
+
 proxy_hev_config() {
     local port="$1" account="$2" secret="$3" quoted
     quoted="$(printf '%s' "$secret" | python3 -c '
@@ -270,6 +314,7 @@ sys.stdout.buffer.write(value.encode("utf-8"))
 }
 
 proxy_create_config() {
+    proxy_check_relay
     proxy_hev_config "$1" "$3" "$4" > "$2/hev.yml"
     printf '%s\n' "$4" > "$2/password"
 }
@@ -329,6 +374,8 @@ probe_socks5() {
 }
 
 probe_hev_socks5() {
+    local relay_addresses
+    relay_addresses="$(proxy_resolve_relay_ipv4 "$4")" || return 1
     # The probes send data through real SOCKS5 sessions to local echo sockets.
     printf '%s\n%s\n' "$2" "$3" | timeout 6 python3 -c '
 import ipaddress
@@ -337,7 +384,7 @@ import struct
 import sys
 
 port = int(sys.argv[1])
-relay_address = ipaddress.ip_address(sys.argv[2])
+relay_addresses = {ipaddress.ip_address(value) for value in sys.argv[2].split()}
 account = sys.stdin.buffer.readline().rstrip(b"\n")
 password = sys.stdin.buffer.readline().rstrip(b"\n")
 local = "127.0.0.1"
@@ -394,7 +441,8 @@ try:
         server.bind((local, 0))
         client.bind((local, 0))
         authenticate(control)
-        if request(control, 3, client.getsockname()) != (relay_address, port):
+        relay_address, relay_port = request(control, 3, client.getsockname())
+        if relay_address not in relay_addresses or relay_port != port:
             raise OSError("unexpected UDP relay address or port")
         header = b"\x00\x00\x00" + address(*server.getsockname())
         # The public NAT address is checked above. The local probe bypasses NAT.
@@ -407,7 +455,7 @@ try:
             raise OSError("invalid UDP relay response")
 except (OSError, ValueError, struct.error) as error:
     sys.exit(str(error))
-' "$1" "$4"
+' "$1" "$relay_addresses"
 }
 
 proxy_wait() {
@@ -487,10 +535,10 @@ proxy_run_debug() {
         /usr/sbin/danted -d1 -f "$dir/danted.conf" -p "/run/$PROXY_KEY-debug-$port/danted.pid"
 }
 
-proxy_replace_socks_unit() {
-    local path="$1" content="$2"
+proxy_replace_socks_file() {
+    local path="$1" content="$2" mode="$3"
     proxy_pending="$(mktemp -- "$path.XXXXXX")" || return 1
-    printf '%s\n' "$content" > "$proxy_pending" && chmod 0644 "$proxy_pending" &&
+    printf '%s\n' "$content" > "$proxy_pending" && chmod "$mode" "$proxy_pending" &&
         mv -fT -- "$proxy_pending" "$path" || return 1
     proxy_pending=''
 }
@@ -499,7 +547,7 @@ proxy_finish_conversion() {
     proxy_cleanup_pending
     if [[ "$conversion_started" == true ]]; then
         if ! systemctl stop "$unit" || ! proxy_stopped "$unit" ||
-            ! proxy_replace_socks_unit "$unit_path" "$original_unit" ||
+            ! proxy_replace_socks_file "$switch_file" "$original_content" "$switch_mode" ||
             ! systemctl daemon-reload; then
             proxy_cleanup_pending
             printf '无法恢复原服务 %s，已保留实例配置以便诊断。\n' "$unit" >&2
@@ -518,17 +566,18 @@ proxy_finish_conversion() {
 }
 
 proxy_convert() {
-    local port="$1" kind="$2" dir unit unit_path original_unit previous_state secret config occupied
+    local port="$1" kind="$2" dir unit previous_state secret config occupied
     local socks_user socks_port socks_hash socks_mode socks_relay
+    local previous_mode previous_relay switch_file original_content switch_mode
     local conversion_started=false conversion_created=false conversion_password_created=false
-    if proxy_socks_is_hev "$kind"; then printf '该实例已使用 TCP/UDP 同端口。\n'; return; fi
     proxy_assert_no_debug "$port"
     proxy_check_unit "$port" "$kind"
     proxy_check_removal "$port" "$kind"
-    proxy_dante_record "$kind" || proxy_fail '无法读取原实例配置。'
+    proxy_socks_record "$kind" || proxy_fail '无法读取原实例配置。'
+    previous_mode="$socks_mode"
+    previous_relay="$socks_relay"
     dir="$(proxy_socks_dir "$kind")"
     unit="$(proxy_unit "$port" "$kind")"
-    unit_path="/etc/systemd/system/$unit"
     previous_state="$(proxy_state "$unit")" || proxy_fail '无法查询原服务状态。'
     if [[ "$previous_state" != active ]]; then
         proxy_stopped "$unit" || proxy_fail '实例正在切换状态，请稍后重试。'
@@ -539,37 +588,60 @@ proxy_convert() {
         secret="$(proxy_prompt '输入原密码以保留当前账号' '' secret)"
     fi
     proxy_valid_password "$secret" || proxy_fail '原密码无效。'
-    proxy_verify_dante_password "$secret" "$socks_hash"
-    proxy_read_mode
+    if [[ "$previous_mode" == dante ]]; then proxy_verify_dante_password "$secret" "$socks_hash"; fi
+    proxy_read_mode "$previous_mode" "$previous_relay"
+    if [[ "$socks_mode" == "$previous_mode" && "$socks_relay" == "$previous_relay" ]]; then
+        printf '当前配置已符合所选设置。\n'
+        return
+    fi
     printf '端口 %s 将保留原账号和密码。在线连接会短暂中断。\n' "$port"
-    proxy_confirm '确认转换该实例' || return 0
+    proxy_confirm '确认应用该实例的新设置' || return 0
     if [[ ! -d "$PROXY_ROOT" ]]; then mkdir -m 0700 -- "$PROXY_ROOT"; fi
     proxy_install_dependencies
-    config="$(proxy_hev_config "$port" "$socks_user" "$secret")"
+    proxy_check_relay
+    if [[ "$previous_mode" == dante ]]; then
+        config="$(proxy_hev_config "$port" "$socks_user" "$secret")"
+    else
+        config="$(awk -v mode="$socks_mode" -v relay="$socks_relay" '
+            /^# Mode: / { print "# Mode: " mode; next }
+            /^  udp-public-address-v4: / { next }
+            { print }
+            /^  udp-port: / && mode == "nat" { print "  udp-public-address-v4: " relay }
+        ' "$dir/hev.yml")"
+    fi
     proxy_prepare_unit "$port" "$kind"
-    original_unit="$(<"$unit_path")"
+    switch_file="$dir/hev.yml"
+    switch_mode=0600
+    if [[ "$previous_mode" == dante ]]; then
+        switch_file="/etc/systemd/system/$unit"
+        switch_mode=0644
+    fi
+    original_content="$(<"$switch_file")"
     trap proxy_finish_conversion EXIT
-    if [[ ! -e "$dir/hev.yml" && ! -L "$dir/hev.yml" ]]; then conversion_created=true; fi
-    proxy_write "$dir/hev.yml" 0600 "$config"
-    if [[ ! -e "$dir/password" && ! -L "$dir/password" ]]; then conversion_password_created=true; fi
-    proxy_write "$dir/password" 0600 "$secret"
+    if [[ "$previous_mode" == dante ]]; then
+        if [[ ! -e "$dir/hev.yml" && ! -L "$dir/hev.yml" ]]; then conversion_created=true; fi
+        proxy_write "$dir/hev.yml" 0600 "$config"
+        if [[ ! -e "$dir/password" && ! -L "$dir/password" ]]; then conversion_password_created=true; fi
+        proxy_write "$dir/password" 0600 "$secret"
+        config="$(proxy_hev_unit_text "$kind")"
+    fi
 
     conversion_started=true
     systemctl stop "$unit"
     proxy_stopped "$unit" || proxy_fail '无法确认原服务已停止。'
     occupied="$(ss -H -lntu "sport = :$port")"
     [[ -z "$occupied" ]] || proxy_fail "端口 $port 仍被其他服务占用。"
-    proxy_replace_socks_unit "$unit_path" "$(proxy_hev_unit_text "$kind")"
+    proxy_replace_socks_file "$switch_file" "$config" "$switch_mode"
     systemctl daemon-reload
     systemctl reset-failed "$unit" 2>/dev/null || true
     systemctl start "$unit" && proxy_wait "$port" "$kind" "$socks_user" "$secret" ||
-        proxy_fail '转换验证失败，正在恢复原服务。'
+        proxy_fail '新设置验证失败，正在恢复原服务。'
     if [[ "$previous_state" != active ]]; then
         systemctl stop "$unit"
         proxy_stopped "$unit" || proxy_fail '无法恢复实例的停止状态。'
     fi
     trap proxy_cleanup_pending EXIT
-    printf '端口 %s 已完成转换，本机 TCP 和 UDP 转发验证通过。\n' "$port"
+    printf '端口 %s 已应用新设置，本机 TCP 和 UDP 转发验证通过。\n' "$port"
 }
 
 proxy_menu "$@"

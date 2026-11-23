@@ -581,7 +581,7 @@ proxy_menu() {
         printf '\n========== %s 管理 ==========\n' "$PROXY_LABEL"
         proxy_scan && proxy_list || proxy_fail '无法读取实例列表。'
         printf '1. 安装\n2. 停止\n3. 卸载\n4. 查看\n5. 启动\n6. 临时日志\n7. 删除实例\n'
-        if declare -F proxy_convert >/dev/null; then printf '8. 转换现有实例为 TCP/UDP 同端口\n'; fi
+        if declare -F proxy_convert >/dev/null; then printf '8. 设置现有实例的同端口模式或 NAT 地址\n'; fi
         printf '0. 返回\n请选择：'
         IFS= read -r action || return 0
         case "$action" in
