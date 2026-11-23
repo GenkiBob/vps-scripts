@@ -44,6 +44,8 @@ apt install dnsutils curl python3 ca-certificates iproute2 util-linux
 cat /var/lib/vps-smartdns/original-resolv.conf > /etc/resolv.conf && systemctl disable --now vps-smartdns.service
 ```
 
+Linux 菜单 `5` 测试 SOCKS5 代理，需要 Bash、curl 7.63 或更新版本、Python 3 和常用 GNU 工具，Ping 项另需 ping。输入 `IP:Port:user:passwd` 后先测 TCP、UDP 各三次，再按需选测。下载和上传每次各传输 10 MB 测试数据，选择对应项目才开始。
+
 ## Windows
 
 使用 Windows PowerShell 5.1 或 PowerShell 7。首次安装或从旧版迁移，在 PowerShell 窗口中执行：

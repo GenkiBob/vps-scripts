@@ -5,6 +5,7 @@ MENU_ITEMS=(
     '2|配置 SmartDNS|scripts/configure-smartdns.sh'
     '3|管理 Shadowsocks 服务端|scripts/install-shadowsocks.sh|scripts/proxy-manager.sh'
     '4|管理 SOCKS5 服务端|scripts/install-socks5.sh|scripts/proxy-manager.sh'
+    '5|测试 SOCKS5 代理|scripts/test-socks5.sh'
 )
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 readonly PROJECT_ROOT
