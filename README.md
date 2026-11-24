@@ -44,7 +44,9 @@ apt install dnsutils curl python3 ca-certificates iproute2 util-linux
 cat /var/lib/vps-smartdns/original-resolv.conf > /etc/resolv.conf && systemctl disable --now vps-smartdns.service
 ```
 
-Linux 菜单 `5` 测试 SOCKS5 代理，需要 Bash、curl 7.63 或更新版本、Python 3 和常用 GNU 工具，Ping 项另需 ping。输入 `IP:Port:user:passwd` 后先测 TCP、UDP 各三次，再按需选测。下载和上传每次各传输 10 MB 测试数据，选择对应项目才开始。
+Linux 菜单 `5` 测试 SOCKS5 代理，需要 Bash、curl 7.63 或更新版本、Python 3、系统 CA 证书和常用 GNU 工具，Ping 项另需 ping。输入 `IP:Port:user:passwd` 后测试三轮，分别显示代理入口 TCP、由代理连接域名后的 HTTPS 响应、UDP 公共 DNS 往返；失败时显示所在阶段。随后可按需选测，下载和上传每次各传输 10 MB 测试数据。
+
+菜单 `4` 的 HEV 临时日志会短暂中断正在运行的实例。此时需要 util-linux 的 `nsenter`，以读取该实例实际使用的 DNS 配置供临时服务使用。已停止的实例使用本机 DNS 调试。
 
 ## Windows
 

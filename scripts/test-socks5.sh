@@ -17,7 +17,7 @@ read_proxy() {
         IFS= read -rs line || { printf '\n'; return 2; }
         printf '\n'
         [[ "$line" != 0 ]] || return 1
-        if [[ "$line" != *:*:*:* || "$line" =~ [[:cntrl:]] ]]; then
+        if [[ "$line" != *:*:*:* || "$line" == *$'\r'* ]]; then
             printf '格式错误，请重新输入。\n'; continue
         fi
         host=${line%%:*}; rest=${line#*:}
@@ -42,6 +42,9 @@ read_proxy() {
             done
         fi
         local LC_ALL=C
+        if [[ "$user" =~ [[:cntrl:]] ]]; then
+            printf '账号含无效控制字符。\n'; continue
+        fi
         if [[ -n "$user" || -n "$password" ]]; then
             if (( ${#user} < 1 || ${#user} > 255 || ${#password} < 1 || ${#password} > 255 )); then
                 printf '认证账号和密码各需 1–255 字节，匿名代理请将两者都留空。\n'; continue
@@ -61,26 +64,30 @@ proxy_curl() {
         auth="$proxy_user:$proxy_password"
         auth=${auth//\\/\\\\}
         auth=${auth//\"/\\\"}
+        auth=${auth//$'\t'/\\t}
         printf -v config 'proxy-user = "%s"' "$auth"
     fi
     curl -q -4 -s --connect-timeout 5 --max-time 12 --noproxy '' \
         --socks5-hostname "$proxy_host:$proxy_port" --config - "$@" <<< "$config"
 }
 
-udp_probe() {
-    # UDP goes to the relay advertised by the proxy. Check a real DNS response
-    # from Cloudflare's public resolver, including its question and transaction ID.
-    printf '%s\n%s\n' "$proxy_user" "$proxy_password" | timeout 8 python3 -c '
+probe_path() {
+    # Flush each stage so an outer timeout retains the last completed TCP connect
+    # and the operation that was waiting. Secrets are passed only on stdin.
+    printf '%s\n%s\n' "$proxy_user" "$proxy_password" | timeout 8 python3 -u -c '
+import http.client
 import io
 import os
 import socket
+import ssl
 import struct
 import sys
+from urllib.parse import urlsplit
 
 def take(stream, size):
     data = stream.read(size)
     if len(data) != size:
-        raise ValueError("short reply")
+        raise ValueError("响应不完整")
     return data
 
 def address(stream):
@@ -92,32 +99,67 @@ def address(stream):
     elif kind == b"\x04":
         host = socket.inet_ntop(socket.AF_INET6, take(stream, 16))
     else:
-        raise ValueError("unknown address type")
+        raise ValueError("未知地址类型")
     return host, int.from_bytes(take(stream, 2), "big")
+
+def request(tcp, reply, command, destination):
+    tcp.sendall(bytes((5, command, 0)) + destination)
+    version, result, reserved = take(reply, 3)
+    if version != 5 or reserved != 0:
+        raise ValueError("SOCKS5 响应无效")
+    if result:
+        reasons = {2: "规则拒绝", 3: "网络不可达", 4: "目的主机不可达", 5: "连接被拒绝",
+                   6: "TTL 到期", 7: "不支持该命令", 8: "不支持该地址类型"}
+        raise ValueError("SOCKS5 REP 0x%02x（%s）" % (result, reasons.get(result, "代理报告失败")))
+    return address(reply)
+
+def stage(name):
+    global current_stage
+    current_stage = name
+    print(name)
 
 def probe():
     user, password = (sys.stdin.buffer.readline().rstrip(b"\n") for _ in range(2))
     method = b"\x02" if user else b"\x00"
     socket.setdefaulttimeout(4)
+    stage("连接代理入口")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
         tcp.connect((sys.argv[1], int(sys.argv[2])))
+        print("TCP_OK")
         with tcp.makefile("rb") as reply:
+            stage("SOCKS5 认证")
             tcp.sendall(b"\x05\x01" + method)
             if take(reply, 2) != b"\x05" + method:
-                raise ValueError("method")
+                raise ValueError("代理未接受认证方式")
             if user:
                 tcp.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
                 if take(reply, 2) != b"\x01\x00":
-                    raise ValueError("auth")
-            tcp.sendall(b"\x05\x03\x00\x01" + bytes(6))
-            if take(reply, 3) != b"\x05\x00\x00":
-                raise ValueError("associate")
-            host, port = address(reply)
+                    raise ValueError("账号或密码被拒绝")
+            if sys.argv[3] == "https":
+                url = urlsplit(sys.argv[4])
+                name = url.hostname.encode("ascii")
+                stage("SOCKS5 域名 CONNECT")
+                request(tcp, reply, 1, b"\x03" + bytes([len(name)]) + name + struct.pack("!H", 443))
+                stage("目标 TLS 握手")
+                with ssl.create_default_context().wrap_socket(tcp, server_hostname=url.hostname) as tls:
+                    stage("目标 HTTPS 响应")
+                    tls.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                                 % (url.path, url.hostname)).encode("ascii"))
+                    with http.client.HTTPResponse(tls) as response:
+                        response.begin()
+                        if not 200 <= response.status <= 599:
+                            raise ValueError("HTTP 状态码 %s" % response.status)
+                        print("HTTP %d" % response.status)
+                return
+            stage("UDP ASSOCIATE")
+            host, port = request(tcp, reply, 3, b"\x01" + bytes(6))
             if host in ("0.0.0.0", "::"):
                 host = tcp.getpeername()[0]
             family = socket.AF_INET6 if ":" in host else socket.AF_INET
+            stage("解析 UDP 中继地址")
             relay = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)[0][4]
             with socket.socket(family, socket.SOCK_DGRAM) as udp:
+                stage("UDP 公共 DNS 往返")
                 udp.connect(relay)
                 resolver = "1.1.1.1"
                 header = b"\x00\x00\x00\x01" + socket.inet_aton(resolver) + struct.pack("!H", 53)
@@ -126,18 +168,29 @@ def probe():
                 udp.send(header + token + struct.pack("!5H", 0x0100, 1, 0, 0, 0) + question)
                 packet = io.BytesIO(udp.recv(4096))
                 if take(packet, 3) != bytes(3) or address(packet) != (resolver, 53):
-                    raise ValueError("unexpected relay response")
+                    raise ValueError("中继回包不匹配")
                 ident, flags, questions = struct.unpack("!2sHH", take(packet, 6))
                 take(packet, 6)
                 if (ident != token or flags & 0xF800 != 0x8000 or questions != 1
                         or take(packet, len(question)).lower() != question):
-                    raise ValueError("unexpected DNS response")
+                    raise ValueError("DNS 回包不匹配")
 
 try:
     probe()
-except (OSError, ValueError):
+except (OSError, ValueError, http.client.HTTPException) as error:
+    if isinstance(error, socket.timeout):
+        reason = "超时"
+    elif isinstance(error, ssl.SSLCertVerificationError):
+        reason = "证书校验失败"
+    elif isinstance(error, ValueError) and not isinstance(error, UnicodeError):
+        reason = str(error)
+    elif isinstance(error, OSError) and error.errno:
+        reason = "系统错误 %s" % error.errno
+    else:
+        reason = "响应无效或连接已关闭"
+    print("%s：%s" % (current_stage, reason))
     sys.exit(1)
-' "$proxy_host" "$proxy_port"
+' "$proxy_host" "$proxy_port" "$1" "$trace_url"
 }
 
 store_result() {
@@ -150,15 +203,37 @@ availability_label() {
 }
 
 availability() {
-    local tcp=0 udp=0 round code
+    local tcp=0 https=0 udp=0 round path report rc detail summary
+    local last_http='' https_failure='' udp_failure=''
     for round in 1 2 3; do
         printf '检测中（第 %s/3 轮）…\n' "$round"
-        if code=$(proxy_curl --max-time 8 -o /dev/null -w '%{http_code}' "$trace_url") && [[ $code =~ ^[2-5][0-9]{2}$ ]]; then
-            ((tcp+=1))
-        fi
-        if udp_probe; then ((udp+=1)); fi
+        for path in https udp; do
+            rc=0
+            report=$(probe_path "$path") || rc=$?
+            report=${report//$'\r'/}
+            if [[ $path == https && $'\n'$report$'\n' == *$'\nTCP_OK\n'* ]]; then ((tcp+=1)); fi
+            if ((rc == 0)); then
+                if [[ $path == https ]]; then
+                    ((https+=1))
+                    last_http=${report##*$'\n'}
+                else
+                    ((udp+=1))
+                fi
+                continue
+            fi
+            detail=${report##*$'\n'}
+            if ((rc == 124)); then detail="${detail:-启动探测}：超时"; fi
+            detail=${detail:-探测进程失败（退出码 $rc）}
+            if [[ $path == https ]]; then https_failure=$detail; else udp_failure=$detail; fi
+            printf '  %s\n' "$detail"
+        done
     done
-    store_result 1 "TCP $(availability_label "$tcp")（$tcp/3）　UDP $(availability_label "$udp")（$udp/3）"
+    printf -v summary '代理入口 TCP %s（%s/3）\n经代理的域名 HTTPS（%s）%s（%s/3）\nUDP 公共 DNS 往返 %s（%s/3）' \
+        "$(availability_label "$tcp")" "$tcp" "${trace_url#https://}" "$(availability_label "$https")" "$https" "$(availability_label "$udp")" "$udp"
+    if [[ -n $last_http ]]; then summary+=$'\n'"目标最近响应：$last_http"; fi
+    if [[ -n $https_failure ]]; then summary+=$'\n'"域名 HTTPS 最近失败：$https_failure"; fi
+    if [[ -n $udp_failure ]]; then summary+=$'\n'"UDP 最近失败：$udp_failure"; fi
+    store_result 1 "$summary"
 }
 
 ping_entry() {
@@ -291,7 +366,7 @@ main() {
     availability
     while true; do
         printf '\nSOCKS5 测试（%s:%s）\n' "$proxy_host" "$proxy_port"
-        printf '%s\n' '1. 重测 TCP / UDP（各 3 次）' '2. Ping 入口（10 次）' \
+        printf '%s\n' '1. 重测入口 TCP、域名 HTTPS 与 UDP（各 3 次）' '2. Ping 入口（10 次）' \
             '3. 比对本机和代理出口 IP' '4. 查询出口归属与 ASN/ISP' '5. 延迟与抖动（10 次）' \
             '6. 下载测速（10 MB）' '7. 上传测速（10 MB）' '8. 查看当前代理检测摘要' '9. 更换代理' '0. 返回主菜单'
         IFS= read -r -p '请选择：' choice || return 0

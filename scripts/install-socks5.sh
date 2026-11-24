@@ -555,14 +555,49 @@ proxy_show() {
     fi
 }
 
+proxy_run_hev_debug() (
+    local config=$1 pid current_pid scratch='' snapshot=''
+    local -a dns_options=()
+    shift
+    if [[ $debug_resume == true ]]; then
+        pid=$(systemctl show -p MainPID --value "$debug_normal") && [[ $pid =~ ^[1-9][0-9]*$ ]] ||
+            { printf '无法确认正式实例 PID，取消调试。\n' >&2; return 1; }
+        scratch=$(mktemp -d /run/vps-socks5-debug-dns.XXXXXXXX) || return 1
+        snapshot="$scratch/resolv.conf"
+        trap 'if [[ -d $scratch ]]; then rm -f -- "$snapshot"; rmdir -- "$scratch"; fi' EXIT
+        trap 'exit 1' HUP INT TERM
+        # Copy before Conflicts= stops the original process and its mount namespace.
+        if ! nsenter --target "$pid" --mount --root -- /bin/cat /etc/resolv.conf > "$snapshot"; then
+            printf '无法读取正式实例的 DNS 配置，取消调试。\n' >&2; return 1
+        fi
+        current_pid=$(systemctl show -p MainPID --value "$debug_normal") && [[ $current_pid == "$pid" ]] ||
+            { printf '正式实例在读取 DNS 时已切换，取消调试。\n' >&2; return 1; }
+        dns_options=(-p "RuntimeDirectory=${scratch##*/}" -p RuntimeDirectoryMode=0700
+            -p "BindReadOnlyPaths=$snapshot:/etc/resolv.conf")
+        if cmp -s /etc/resolv.conf "$snapshot"; then
+            printf '临时日志沿用正式实例的 DNS 配置。\n'
+        else
+            printf '正式实例与本机的 DNS 配置不同，临时日志沿用正式实例的配置。\n'
+        fi
+    else
+        printf '正式实例已停止，无法读取其运行时 DNS；本次临时日志使用本机 DNS。\n'
+    fi
+    systemd-run "$@" "${dns_options[@]}" -p Type=exec -p PrivateTmp=yes -p ProtectSystem=full -p ProtectHome=yes \
+        /bin/bash -c '
+            if [[ -n $3 ]] && ! cmp -s -- "$3" /etc/resolv.conf; then
+                printf "临时实例的 DNS 与正式实例快照不一致，取消调试。\n" >&2
+                exit 1
+            fi
+            exec "$1" /dev/fd/3 3< <(sed "s/^  log-level: warn$/  log-level: debug/" "$2")
+        ' bash "$HEV_BINARY" "$config" "$snapshot"
+)
+
 proxy_run_debug() {
     local port="$1" kind="$2" dir
     shift 2
     dir="$(proxy_socks_dir "$kind")"
     if proxy_socks_is_hev "$kind"; then
-        systemd-run "$@" -p Type=exec -p PrivateTmp=yes -p ProtectSystem=full -p ProtectHome=yes \
-            /bin/bash -c 'exec "$1" /dev/fd/3 3< <(sed "s/^  log-level: warn$/  log-level: debug/" "$2")' \
-            bash "$HEV_BINARY" "$dir/hev.yml"
+        proxy_run_hev_debug "$dir/hev.yml" "$@"
         return
     fi
     proxy_check_pam "$port" "$kind"
@@ -680,4 +715,4 @@ proxy_convert() {
     printf '端口 %s 已应用新设置，本机 TCP 和 UDP 转发验证通过。\n' "$port"
 }
 
-proxy_menu "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then proxy_menu "$@"; fi
